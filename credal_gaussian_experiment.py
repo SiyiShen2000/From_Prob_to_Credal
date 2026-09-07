@@ -34,27 +34,25 @@ TRANSFORMATIONS = [
     "comparative",
 ]
 
-# Pairwise distance between the three Gaussian means.
-# With covariance I, these values give roughly:
-#   high overlap   -> Bayes accuracy ~ 0.65
-#   medium overlap -> Bayes accuracy ~ 0.82
-#   low overlap    -> Bayes accuracy ~ 0.96
-OVERLAP_LEVELS = {
-    "low": 4.0,
-    "medium": 2.5,
-    "high": 1.5,
-}
+# Fixed separation of the three Gaussian class means in the noise study.
+NOISE_PAIRWISE_DISTANCE = 2.5
 
-# Quality is matched by mean KL(true posterior || noisy soft label).
-# Lower KL = higher label quality.
-QUALITY_TARGET_KL = {
-    "high": 0.02,
-    "medium": 0.10,
-    "low": 0.30,
-}
+# Direct noise strengths: shared mixing proportions, not KL-matched quality.
+DEFAULT_RHO_VALUES = (0.1, 0.3, 0.5)
+QUALITY_LEVELS = ("high", "medium", "low")
 
-# For the noise study, keep the data overlap fixed.
-NOISE_STUDY_OVERLAP = "medium"
+
+def quality_rho_levels(rho_values: Sequence[float]) -> Dict[str, float]:
+    """Map high/medium/low label quality to increasing noise strengths."""
+    values = sorted(float(rho) for rho in rho_values)
+    if len(values) != 3 or len(set(values)) != 3:
+        raise ValueError("Provide exactly three distinct rho values for high/medium/low quality")
+    if any(not math.isfinite(rho) or not 0 <= rho <= 1 for rho in values):
+        raise ValueError("rho values must be finite and between 0 and 1")
+    return dict(zip(QUALITY_LEVELS, values))
+
+
+NOISE_TYPES = ("uniform", "corruption")  # corruption always means class corruption
 
 # Shared delta for PMM, LV, QCOR and TV.
 # This is intentionally exposed because equal delta does NOT imply equal
@@ -203,21 +201,10 @@ def uniform_mixing(p: np.ndarray, rho: float) -> np.ndarray:
     return (1.0 - rho) * p + rho * u
 
 
-def temperature_scaling_from_probabilities(
-    p: np.ndarray,
-    temperature: float,
-    eps: float = 1e-12,
-) -> np.ndarray:
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
-    logits = np.log(np.clip(p, eps, 1.0))
-    return softmax_np(logits / temperature)
-
-
 def class_corruption_to_second_best(p: np.ndarray, rho: float) -> np.ndarray:
     """
     Move a fraction rho of the probability mass toward the second-most likely
-    class under the true posterior. Unlike uniform mixing / temperature scaling,
+    class under the true posterior. Unlike uniform mixing,
     this can change the top-1 class and create misleading labels.
     """
     second_best = np.argsort(p, axis=1)[:, -2]
@@ -226,126 +213,36 @@ def class_corruption_to_second_best(p: np.ndarray, rho: float) -> np.ndarray:
     return (1.0 - rho) * p + rho * e
 
 
-def logit_gaussian_corruption(
-    p: np.ndarray,
-    sigma: float,
-    fixed_noise: np.ndarray,
-    eps: float = 1e-12,
-) -> np.ndarray:
-    if fixed_noise.shape != p.shape:
-        raise ValueError("fixed_noise must have the same shape as p")
-    logits = np.log(np.clip(p, eps, 1.0)) + sigma * fixed_noise
-    return softmax_np(logits)
-
-
 @dataclass
 class NoisyLabelResult:
     probabilities: np.ndarray
-    parameter_name: str
-    parameter_value: float
+    rho: float
     achieved_mean_kl: float
     top1_agreement_with_bayes: float
-
-
-def _select_candidate_closest_to_target(
-    p_true: np.ndarray,
-    candidates: Sequence[Tuple[float, np.ndarray]],
-    parameter_name: str,
-    target_kl: float,
-) -> NoisyLabelResult:
-    best = None
-    for value, q in candidates:
-        mean_kl = float(rowwise_kl(p_true, q).mean())
-        error = abs(mean_kl - target_kl)
-        if best is None or error < best[0]:
-            best = (error, value, q, mean_kl)
-
-    assert best is not None
-    _, value, q_best, mean_kl = best
-    agreement = float(
-        (np.argmax(q_best, axis=1) == np.argmax(p_true, axis=1)).mean()
-    )
-    return NoisyLabelResult(
-        probabilities=q_best,
-        parameter_name=parameter_name,
-        parameter_value=float(value),
-        achieved_mean_kl=float(mean_kl),
-        top1_agreement_with_bayes=agreement,
-    )
 
 
 def make_noisy_probabilistic_labels(
     p_true: np.ndarray,
     noise_type: str,
-    target_kl: float,
-    seed: int,
-    corruption_kind: str = "class",
-    temperature_direction: str = "overconfident",
+    rho: float,
 ) -> NoisyLabelResult:
-    """
-    Match soft-label quality across noise mechanisms by targeting the same
-    mean KL(true posterior || noisy label).
-
-    noise_type:
-      - 'uniform'
-      - 'temperature'
-      - 'corruption'
-
-    corruption_kind:
-      - 'class': shift mass toward the second-best class
-      - 'logit': add Gaussian noise in logit space
-    """
+    """Apply a specified mixing proportion; KL is diagnostic only."""
+    if not np.isfinite(rho) or not 0.0 <= rho <= 1.0:
+        raise ValueError("rho must be finite and between 0 and 1")
     if noise_type == "uniform":
-        grid = np.linspace(0.0, 0.98, 250)
-        candidates = [(rho, uniform_mixing(p_true, rho)) for rho in grid]
-        return _select_candidate_closest_to_target(
-            p_true, candidates, "rho_uniform", target_kl
-        )
-
-    if noise_type == "temperature":
-        if temperature_direction == "overconfident":
-            # T < 1 sharpens the distribution while preserving ranking.
-            grid = np.geomspace(1.0, 0.12, 250)
-        elif temperature_direction == "underconfident":
-            # T > 1 flattens the distribution while preserving ranking.
-            grid = np.geomspace(1.0, 12.0, 250)
-        else:
-            raise ValueError("Unknown temperature_direction")
-
-        candidates = [
-            (T, temperature_scaling_from_probabilities(p_true, float(T)))
-            for T in grid
-        ]
-        return _select_candidate_closest_to_target(
-            p_true, candidates, "temperature", target_kl
-        )
-
-    if noise_type == "corruption":
-        if corruption_kind == "class":
-            grid = np.linspace(0.0, 0.98, 250)
-            candidates = [
-                (rho, class_corruption_to_second_best(p_true, rho))
-                for rho in grid
-            ]
-            return _select_candidate_closest_to_target(
-                p_true, candidates, "rho_class_corruption", target_kl
-            )
-
-        if corruption_kind == "logit":
-            rng = np.random.default_rng(seed)
-            fixed_noise = rng.normal(size=p_true.shape)
-            grid = np.linspace(0.0, 4.0, 250)
-            candidates = [
-                (sigma, logit_gaussian_corruption(p_true, sigma, fixed_noise))
-                for sigma in grid
-            ]
-            return _select_candidate_closest_to_target(
-                p_true, candidates, "sigma_logit_corruption", target_kl
-            )
-
-        raise ValueError("corruption_kind must be 'class' or 'logit'")
-
-    raise ValueError(f"Unknown noise_type: {noise_type}")
+        q = uniform_mixing(p_true, rho)
+    elif noise_type == "corruption":
+        q = class_corruption_to_second_best(p_true, rho)
+    else:
+        raise ValueError("noise_type must be 'uniform' or 'corruption'")
+    return NoisyLabelResult(
+        probabilities=q,
+        rho=float(rho),
+        achieved_mean_kl=float(rowwise_kl(p_true, q).mean()),
+        top1_agreement_with_bayes=float(
+            (np.argmax(q, axis=1) == np.argmax(p_true, axis=1)).mean()
+        ),
+    )
 
 
 # ============================================================
@@ -491,7 +388,11 @@ def credal_constraints_3class(
     b: List[float] = []
 
     if method == "pmm":
-        # q_i <= (1+delta) p_i
+        # PMM upper constraints:
+        # q_i <= min(1, (1 + delta) * p_i).
+        # The corresponding lower bounds
+        # q_i >= max(0, (1 + delta) * p_i - delta)
+        # follow implicitly from sum(q) = 1 and the constraints for other classes.
         upper = (1.0 + delta) * p
         for i in range(N_CLASSES):
             row = np.zeros(N_CLASSES)
@@ -648,6 +549,9 @@ def solve_q_star_lp(
 class VertexBank:
     vertices: torch.Tensor  # [N, Vmax, C]
     mask: torch.Tensor      # [N, Vmax]
+    A_ub: torch.Tensor      # [N, Mmax, C]
+    b_ub: torch.Tensor      # [N, Mmax]
+    constraint_mask: torch.Tensor  # [N, Mmax]
     mean_num_vertices: float
     mean_area: float
     true_posterior_coverage: float
@@ -675,14 +579,29 @@ def prepare_vertex_bank(
     padded = np.zeros((n, max_v, N_CLASSES), dtype=np.float32)
     mask = np.zeros((n, max_v), dtype=bool)
 
+    max_m = max(len(c.b_ub) for c in credal_sets)
+    A_padded = np.zeros((n, max_m, N_CLASSES), dtype=np.float32)
+    b_padded = np.zeros((n, max_m), dtype=np.float32)
+    constraint_mask = np.zeros((n, max_m), dtype=bool)
+
     for i, credal in enumerate(credal_sets):
         v = credal.vertices.astype(np.float32)
         padded[i, : len(v)] = v
         mask[i, : len(v)] = True
 
+        m = len(credal.b_ub)
+        A_padded[i, :m] = credal.A_ub.astype(np.float32)
+        b_padded[i, :m] = credal.b_ub.astype(np.float32)
+        constraint_mask[i, :m] = True
+
     return VertexBank(
         vertices=torch.tensor(padded, dtype=torch.float32, device=device),
         mask=torch.tensor(mask, dtype=torch.bool, device=device),
+        A_ub=torch.tensor(A_padded, dtype=torch.float32, device=device),
+        b_ub=torch.tensor(b_padded, dtype=torch.float32, device=device),
+        constraint_mask=torch.tensor(
+            constraint_mask, dtype=torch.bool, device=device
+        ),
         mean_num_vertices=float(np.mean([len(c.vertices) for c in credal_sets])),
         mean_area=float(np.mean(areas)),
         true_posterior_coverage=float(np.mean(coverage)),
@@ -722,6 +641,119 @@ class TrainConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     hidden_dims: Tuple[int, ...] = (64, 64)
+    loss_name: str = "cross_entropy"
+
+
+def categorical_loss_from_log_probs(
+    targets: torch.Tensor,
+    log_probs: torch.Tensor,
+    loss_name: str,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Return unreduced CE or KL(target || prediction)."""
+    cross_entropy = -(targets * log_probs).sum(dim=-1)
+    if loss_name == "cross_entropy":
+        return cross_entropy
+    if loss_name == "kl":
+        # Define 0 * log(0) as 0, as required by categorical KL divergence.
+        target_log_probs = torch.where(
+            targets > 0,
+            torch.log(targets.clamp_min(eps)),
+            torch.zeros_like(targets),
+        )
+        return cross_entropy + (targets * target_log_probs).sum(dim=-1)
+    raise ValueError(f"Unknown loss_name: {loss_name}")
+
+
+@torch.no_grad()
+def minimum_kl_target_in_credal_set(
+    log_probs: torch.Tensor,
+    vertices: torch.Tensor,
+    vertex_mask: torch.Tensor,
+    A_ub: torch.Tensor,
+    b_ub: torch.Tensor,
+    constraint_mask: torch.Tensor,
+    bisection_steps: int = 32,
+    feasibility_tol: float = 1e-6,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Compute argmin_q KL(q || prediction) over 3-class credal sets.
+
+    A three-class probability simplex is two-dimensional. If the prediction is
+    feasible, it is the KL minimizer. Otherwise, the minimizer lies on the
+    boundary of the convex credal polygon. Every boundary edge joins two
+    vertices, so minimizing KL on all vertex pairs (including all true edges)
+    and taking the best candidate recovers the full-set minimum. Extra diagonal
+    pairs contain only feasible points and therefore do not change the minimum.
+    """
+    if log_probs.ndim != 2 or log_probs.shape[1] != N_CLASSES:
+        raise ValueError("log_probs must have shape [B, 3]")
+    if vertices.ndim != 3 or vertices.shape[0] != len(log_probs):
+        raise ValueError("vertices must have shape [B, Vmax, 3]")
+
+    probs = log_probs.exp()
+    if A_ub.shape[1] == 0:
+        feasible = torch.ones(len(probs), dtype=torch.bool, device=probs.device)
+    else:
+        lhs = torch.einsum("bmc,bc->bm", A_ub, probs)
+        constraints_satisfied = (lhs <= b_ub + feasibility_tol) | ~constraint_mask
+        feasible = constraints_satisfied.all(dim=1)
+
+    # Vertices cover singleton credal sets and provide stable endpoint candidates.
+    vertex_kl = categorical_loss_from_log_probs(
+        vertices,
+        log_probs[:, None, :],
+        "kl",
+        eps=eps,
+    ).masked_fill(~vertex_mask, float("inf"))
+    best_vertex_idx = torch.argmin(vertex_kl, dim=1)
+    batch_indices = torch.arange(len(log_probs), device=log_probs.device)
+    best_q = vertices[batch_indices, best_vertex_idx]
+    best_kl = vertex_kl[batch_indices, best_vertex_idx]
+
+    vmax = vertices.shape[1]
+    if vmax >= 2:
+        pair_indices = torch.triu_indices(
+            vmax, vmax, offset=1, device=vertices.device
+        )
+        left_idx, right_idx = pair_indices[0], pair_indices[1]
+        pair_mask = vertex_mask[:, left_idx] & vertex_mask[:, right_idx]
+
+        left = vertices[:, left_idx, :]
+        direction = vertices[:, right_idx, :] - left
+        low = torch.zeros_like(pair_mask, dtype=vertices.dtype)
+        high = torch.ones_like(low)
+
+        # KL is convex along each line segment. Its directional derivative is
+        # monotone, so bisection locates the segment minimum, including limits
+        # at either endpoint.
+        for _ in range(bisection_steps):
+            mid = (low + high) * 0.5
+            q_mid = left + mid[..., None] * direction
+            kl_gradient = (
+                torch.log(q_mid.clamp_min(eps))
+                - log_probs[:, None, :]
+                + 1.0
+            )
+            derivative = (direction * kl_gradient).sum(dim=-1)
+            move_right = derivative < 0
+            low = torch.where(move_right, mid, low)
+            high = torch.where(move_right, high, mid)
+
+        segment_q = left + ((low + high) * 0.5)[..., None] * direction
+        segment_kl = categorical_loss_from_log_probs(
+            segment_q,
+            log_probs[:, None, :],
+            "kl",
+            eps=eps,
+        ).masked_fill(~pair_mask, float("inf"))
+        best_segment_kl, best_segment_idx = segment_kl.min(dim=1)
+        best_segment_q = segment_q[batch_indices, best_segment_idx]
+        use_segment = best_segment_kl < best_kl
+        best_q = torch.where(use_segment[:, None], best_segment_q, best_q)
+
+    # KL(q || p) is zero at q=p, so a feasible prediction is the global optimum.
+    return torch.where(feasible[:, None], probs, best_q).detach()
 
 
 def train_mlp(
@@ -736,10 +768,17 @@ def train_mlp(
 ) -> SimpleMLP:
     """
     mode:
-      - 'hard'   : CE(one-hot observed label, prediction)
-      - 'soft'   : CE(soft target, prediction)
-      - 'credal' : min_{q in M_i} CE(q, prediction), solved over precomputed vertices
+      - 'hard'   : loss(one-hot observed label, prediction)
+      - 'soft'   : loss(soft target, prediction)
+      - 'credal' : minimum loss over M_i
+
+    With cross-entropy, vertex minimization is exact over the full convex credal
+    set because CE is linear in its target. With KL, q_star is the full-set KL
+    projection and may be an interior point or a point inside a boundary edge.
     """
+    if config.loss_name not in {"cross_entropy", "kl"}:
+        raise ValueError("loss_name must be 'cross_entropy' or 'kl'")
+
     set_all_seeds(seed)
     model = SimpleMLP(hidden_dims=config.hidden_dims).to(device)
     optimizer = torch.optim.Adam(
@@ -771,13 +810,23 @@ def train_mlp(
             log_probs = F.log_softmax(logits, dim=-1)
 
             if mode == "hard":
-                loss = F.cross_entropy(logits, y_t[ids])
+                if config.loss_name == "cross_entropy":
+                    loss = F.cross_entropy(logits, y_t[ids])
+                else:
+                    qb = F.one_hot(y_t[ids], num_classes=N_CLASSES).to(
+                        dtype=log_probs.dtype
+                    )
+                    loss = categorical_loss_from_log_probs(
+                        qb, log_probs, config.loss_name
+                    ).mean()
 
             elif mode == "soft":
                 if soft_t is None:
                     raise ValueError("soft_targets are required in soft mode")
                 qb = soft_t[ids]
-                loss = -(qb * log_probs).sum(dim=-1).mean()
+                loss = categorical_loss_from_log_probs(
+                    qb, log_probs, config.loss_name
+                ).mean()
 
             elif mode == "credal":
                 if vertex_bank is None:
@@ -786,20 +835,35 @@ def train_mlp(
                 # V_b: [B, Vmax, C]
                 V_b = vertex_bank.vertices[ids]
                 mask_b = vertex_bank.mask[ids]
-
-                # CE(v, s) for every available vertex v.
-                # Invalid padded vertices receive +infinity.
-                ce_all = -(V_b * log_probs[:, None, :]).sum(dim=-1)
-                ce_all = ce_all.masked_fill(~mask_b, float("inf"))
-
-                best_idx = torch.argmin(ce_all, dim=1)
-                q_star = V_b[
-                    torch.arange(len(ids), device=device),
-                    best_idx,
-                ].detach()
+                if config.loss_name == "cross_entropy":
+                    # CE is linear in q, so a minimum over the full convex set
+                    # is attained at a vertex.
+                    losses_all = categorical_loss_from_log_probs(
+                        V_b,
+                        log_probs[:, None, :],
+                        "cross_entropy",
+                    ).masked_fill(~mask_b, float("inf"))
+                    best_idx = torch.argmin(losses_all, dim=1)
+                    q_star = V_b[
+                        torch.arange(len(ids), device=device),
+                        best_idx,
+                    ].detach()
+                else:
+                    # KL is convex rather than linear in q. Its minimum can be
+                    # inside the credal set, so optimize over the full polygon.
+                    q_star = minimum_kl_target_in_credal_set(
+                        log_probs=log_probs,
+                        vertices=V_b,
+                        vertex_mask=mask_b,
+                        A_ub=vertex_bank.A_ub[ids],
+                        b_ub=vertex_bank.b_ub[ids],
+                        constraint_mask=vertex_bank.constraint_mask[ids],
+                    )
 
                 # Stop-gradient target q_star; gradient flows only through logits.
-                loss = -(q_star * log_probs).sum(dim=-1).mean()
+                loss = categorical_loss_from_log_probs(
+                    q_star, log_probs, config.loss_name
+                ).mean()
 
             else:
                 raise ValueError(f"Unknown training mode: {mode}")
@@ -864,134 +928,25 @@ def bayes_metrics(y_test: np.ndarray, p_true_test: np.ndarray) -> Dict[str, floa
 
 
 # ============================================================
-# 8. Controlled experiment A: vary overlap, no noisy labels
+# 8. Noise study: independent repeats, fixed Gaussian separation
 # ============================================================
 
 
-def run_overlap_study(
-    output_dir: Path,
-    n_train: int,
-    n_test: int,
-    repeats: int,
-    train_config: TrainConfig,
-    credal_delta: float,
-    device: torch.device,
-) -> pd.DataFrame:
-    rows: List[Dict[str, object]] = []
-
-    for overlap_name, distance in OVERLAP_LEVELS.items():
-        # Same random seeds across overlap levels: only Gaussian separation changes.
-        train_data = generate_gmm_dataset(n_train, distance, seed=1001)
-        test_data = generate_gmm_dataset(n_test, distance, seed=2001)
-        x_train, x_test = standardize_train_test(train_data.x, test_data.x)
-        bayes = bayes_metrics(test_data.y, test_data.true_posterior)
-
-        # Credal sets are generated from the exact posterior: NO soft-label noise here.
-        vertex_banks: Dict[str, VertexBank] = {}
-        for method in TRANSFORMATIONS:
-            vertex_banks[method] = prepare_vertex_bank(
-                train_data.true_posterior,
-                train_data.true_posterior,
-                method,
-                credal_delta,
-                device,
-            )
-
-        for repeat in range(repeats):
-            model_seed = 5000 + repeat
-
-            # Oracle posterior supervision.
-            model = train_mlp(
-                x_train,
-                train_data.y,
-                mode="soft",
-                soft_targets=train_data.true_posterior,
-                config=train_config,
-                device=device,
-                seed=model_seed,
-            )
-            metrics = evaluate_model(
-                model, x_test, test_data.y, test_data.true_posterior, device
-            )
-            rows.append({
-                "study": "overlap",
-                "overlap": overlap_name,
-                "pairwise_distance": distance,
-                "repeat": repeat,
-                "method": "oracle_posterior",
-                "target_type": "baseline",
-                "credal_delta": np.nan,
-                "mean_credal_area": np.nan,
-                "true_posterior_coverage": np.nan,
-                **bayes,
-                **metrics,
-            })
-
-            # Clean sampled hard labels.
-            model = train_mlp(
-                x_train,
-                train_data.y,
-                mode="hard",
-                config=train_config,
-                device=device,
-                seed=model_seed,
-            )
-            metrics = evaluate_model(
-                model, x_test, test_data.y, test_data.true_posterior, device
-            )
-            rows.append({
-                "study": "overlap",
-                "overlap": overlap_name,
-                "pairwise_distance": distance,
-                "repeat": repeat,
-                "method": "clean_sampled_hard",
-                "target_type": "baseline",
-                "credal_delta": np.nan,
-                "mean_credal_area": np.nan,
-                "true_posterior_coverage": np.nan,
-                **bayes,
-                **metrics,
-            })
-
-            # Credal supervision from clean exact posterior.
-            for method in TRANSFORMATIONS:
-                bank = vertex_banks[method]
-                model = train_mlp(
-                    x_train,
-                    train_data.y,
-                    mode="credal",
-                    vertex_bank=bank,
-                    config=train_config,
-                    device=device,
-                    seed=model_seed,
-                )
-                metrics = evaluate_model(
-                    model, x_test, test_data.y, test_data.true_posterior, device
-                )
-                rows.append({
-                    "study": "overlap",
-                    "overlap": overlap_name,
-                    "pairwise_distance": distance,
-                    "repeat": repeat,
-                    "method": method,
-                    "target_type": "credal",
-                    "credal_delta": credal_delta,
-                    "mean_credal_area": bank.mean_area,
-                    "true_posterior_coverage": bank.true_posterior_coverage,
-                    **bayes,
-                    **metrics,
-                })
-
-    df = pd.DataFrame(rows)
-    path = output_dir / "overlap_study.csv"
-    df.to_csv(path, index=False)
-    print(f"Saved overlap study to {path}")
-    return df
+def resolve_seeds(repeats: int, seeds: Optional[Sequence[int]]) -> List[int]:
+    values = list(range(repeats)) if seeds is None else list(seeds)
+    if repeats < 1 or len(values) != repeats or len(set(values)) != repeats:
+        raise ValueError("Provide one distinct seed per repeat, with repeats >= 1")
+    if any(not isinstance(seed, (int, np.integer)) or seed < 0 for seed in values):
+        raise ValueError("Seeds must be nonnegative integers")
+    return values
 
 
-# ============================================================
-# 9. Controlled experiment B: fix overlap, vary noisy-label quality
-# ============================================================
+def experiment_seeds(seed: int) -> Dict[str, int]:
+    """Independent streams per repeat; shared across methods and noise conditions."""
+    # Keep namespace 1 to reproduce noise-study seeds from earlier versions.
+    streams = np.random.SeedSequence([seed, 1]).generate_state(3)
+    return dict(seed=int(seed), train_seed=int(streams[0]),
+                test_seed=int(streams[1]), model_seed=int(streams[2]))
 
 
 def run_noise_study(
@@ -1002,24 +957,48 @@ def run_noise_study(
     train_config: TrainConfig,
     credal_delta: float,
     device: torch.device,
-    corruption_kind: str,
-    temperature_direction: str,
+    rho_values: Sequence[float] = DEFAULT_RHO_VALUES,
+    seeds: Optional[Sequence[int]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    overlap_name = NOISE_STUDY_OVERLAP
-    distance = OVERLAP_LEVELS[overlap_name]
-
-    train_data = generate_gmm_dataset(n_train, distance, seed=3001)
-    test_data = generate_gmm_dataset(n_test, distance, seed=4001)
-    x_train, x_test = standardize_train_test(train_data.x, test_data.x)
-    bayes = bayes_metrics(test_data.y, test_data.true_posterior)
+    seeds = resolve_seeds(repeats, seeds)
+    quality_rhos = quality_rho_levels(rho_values)
+    distance = NOISE_PAIRWISE_DISTANCE
 
     rows: List[Dict[str, object]] = []
     quality_rows: List[Dict[str, object]] = []
+    noise_types = NOISE_TYPES
+    total_conditions = len(noise_types) * len(rho_values)
+    total_models = repeats * 2 + total_conditions * repeats * (
+        1 + len(TRANSFORMATIONS)
+    )
+    model_index = 0
+    condition_index = 0
+    print(
+        f"[noise] Starting study with {total_conditions} noise conditions and "
+        f"{total_models} model trainings using loss={train_config.loss_name}.",
+        flush=True,
+    )
 
-    # Baselines independent of noisy-label mechanism/quality.
-    for repeat in range(repeats):
-        model_seed = 7000 + repeat
+    # Baselines independent of noisy-label mechanism/rho.
+    for repeat, seed in enumerate(seeds):
+        seed_info = experiment_seeds(seed)
+        model_seed = seed_info["model_seed"]
+        condition_index = 0
+        print(f"[noise] Repeat {repeat + 1}/{repeats}: {seed_info}", flush=True)
+        train_data = generate_gmm_dataset(n_train, distance, seed=seed_info['train_seed'])
+        test_data = generate_gmm_dataset(n_test, distance, seed=seed_info['test_seed'])
+        x_train, x_test = standardize_train_test(train_data.x, test_data.x)
+        bayes = bayes_metrics(test_data.y, test_data.true_posterior)
 
+
+        model_index += 1
+        progress_label = (
+            f"baseline, repeat={repeat + 1}/{repeats}, method=oracle_posterior"
+        )
+        print(
+            f"[noise {model_index}/{total_models}] Training {progress_label}...",
+            flush=True,
+        )
         model = train_mlp(
             x_train,
             train_data.y,
@@ -1032,17 +1011,21 @@ def run_noise_study(
         metrics = evaluate_model(
             model, x_test, test_data.y, test_data.true_posterior, device
         )
+        print(
+            f"[noise {model_index}/{total_models}] Finished {progress_label}; "
+            f"accuracy={metrics['accuracy']:.4f}.",
+            flush=True,
+        )
         rows.append({
             "study": "noise",
-            "overlap": overlap_name,
+            "pairwise_distance": distance,
             "noise_type": "baseline",
+            "rho": np.nan,
             "quality": "baseline",
-            "target_mean_label_kl": 0.0,
             "achieved_mean_label_kl": 0.0,
             "top1_agreement_with_bayes": 1.0,
-            "noise_parameter": np.nan,
-            "noise_parameter_value": np.nan,
             "repeat": repeat,
+            **seed_info,
             "method": "oracle_posterior",
             "target_type": "baseline",
             "mean_credal_area": np.nan,
@@ -1051,6 +1034,14 @@ def run_noise_study(
             **metrics,
         })
 
+        model_index += 1
+        progress_label = (
+            f"baseline, repeat={repeat + 1}/{repeats}, method=clean_sampled_hard"
+        )
+        print(
+            f"[noise {model_index}/{total_models}] Training {progress_label}...",
+            flush=True,
+        )
         model = train_mlp(
             x_train,
             train_data.y,
@@ -1062,17 +1053,21 @@ def run_noise_study(
         metrics = evaluate_model(
             model, x_test, test_data.y, test_data.true_posterior, device
         )
+        print(
+            f"[noise {model_index}/{total_models}] Finished {progress_label}; "
+            f"accuracy={metrics['accuracy']:.4f}.",
+            flush=True,
+        )
         rows.append({
             "study": "noise",
-            "overlap": overlap_name,
+            "pairwise_distance": distance,
             "noise_type": "baseline",
+            "rho": np.nan,
             "quality": "baseline",
-            "target_mean_label_kl": np.nan,
             "achieved_mean_label_kl": np.nan,
             "top1_agreement_with_bayes": np.nan,
-            "noise_parameter": np.nan,
-            "noise_parameter_value": np.nan,
             "repeat": repeat,
+            **seed_info,
             "method": "clean_sampled_hard",
             "target_type": "baseline",
             "mean_credal_area": np.nan,
@@ -1081,45 +1076,59 @@ def run_noise_study(
             **metrics,
         })
 
-    noise_types = ["uniform", "temperature", "corruption"]
-
-    for noise_index, noise_type in enumerate(noise_types):
-        for quality_name, target_kl in QUALITY_TARGET_KL.items():
-            noisy = make_noisy_probabilistic_labels(
-                train_data.true_posterior,
-                noise_type=noise_type,
-                target_kl=target_kl,
-                seed=9000 + noise_index,
-                corruption_kind=corruption_kind,
-                temperature_direction=temperature_direction,
-            )
-
-            quality_rows.append({
-                "overlap": overlap_name,
-                "noise_type": noise_type,
-                "quality": quality_name,
-                "target_mean_label_kl": target_kl,
-                "achieved_mean_label_kl": noisy.achieved_mean_kl,
-                "top1_agreement_with_bayes": noisy.top1_agreement_with_bayes,
-                "noise_parameter": noisy.parameter_name,
-                "noise_parameter_value": noisy.parameter_value,
-            })
-
-            # Precompute all credal sets once per noisy-label condition.
-            banks: Dict[str, VertexBank] = {}
-            for method in TRANSFORMATIONS:
-                banks[method] = prepare_vertex_bank(
-                    noisy.probabilities,
+        for noise_type in noise_types:
+            for quality, rho in quality_rhos.items():
+                condition_index += 1
+                print(
+                    f"[noise] Preparing condition {condition_index}/{total_conditions}: "
+                    f"noise_type={noise_type}, quality={quality}, rho={rho}.",
+                    flush=True,
+                )
+                noisy = make_noisy_probabilistic_labels(
                     train_data.true_posterior,
-                    method,
-                    credal_delta,
-                    device,
+                    noise_type=noise_type,
+                    rho=rho,
                 )
 
-            for repeat in range(repeats):
-                model_seed = 7000 + repeat
+                quality_rows.append({
+                    "repeat": repeat,
+                    **seed_info,
+                    "pairwise_distance": distance,
+                    "noise_type": noise_type,
+                    "rho": noisy.rho,
+                    "quality": quality,
+                    "achieved_mean_label_kl": noisy.achieved_mean_kl,
+                    "top1_agreement_with_bayes": noisy.top1_agreement_with_bayes,
+                })
+
+                # Precompute all credal sets once per noisy-label condition.
+                banks: Dict[str, VertexBank] = {}
+                for method_index, method in enumerate(TRANSFORMATIONS, start=1):
+                    print(
+                        f"[noise] Building vertex bank {method_index}/"
+                        f"{len(TRANSFORMATIONS)} for method={method}...",
+                        flush=True,
+                    )
+                    banks[method] = prepare_vertex_bank(
+                        noisy.probabilities,
+                        train_data.true_posterior,
+                        method,
+                        credal_delta,
+                        device,
+                    )
+
 
                 # Direct noisy-soft-label baseline.
+                model_index += 1
+                progress_label = (
+                    f"noise_type={noise_type}, quality={quality}, rho={rho}, "
+                    f"repeat={repeat + 1}/{repeats}, method=noisy_soft"
+                )
+                print(
+                    f"[noise {model_index}/{total_models}] Training "
+                    f"{progress_label}...",
+                    flush=True,
+                )
                 model = train_mlp(
                     x_train,
                     train_data.y,
@@ -1132,17 +1141,21 @@ def run_noise_study(
                 metrics = evaluate_model(
                     model, x_test, test_data.y, test_data.true_posterior, device
                 )
+                print(
+                    f"[noise {model_index}/{total_models}] Finished "
+                    f"{progress_label}; accuracy={metrics['accuracy']:.4f}.",
+                    flush=True,
+                )
                 rows.append({
                     "study": "noise",
-                    "overlap": overlap_name,
+                    "pairwise_distance": distance,
                     "noise_type": noise_type,
-                    "quality": quality_name,
-                    "target_mean_label_kl": target_kl,
+                    "rho": noisy.rho,
+                    "quality": quality,
                     "achieved_mean_label_kl": noisy.achieved_mean_kl,
                     "top1_agreement_with_bayes": noisy.top1_agreement_with_bayes,
-                    "noise_parameter": noisy.parameter_name,
-                    "noise_parameter_value": noisy.parameter_value,
                     "repeat": repeat,
+                    **seed_info,
                     "method": "noisy_soft",
                     "target_type": "baseline",
                     "mean_credal_area": np.nan,
@@ -1154,6 +1167,16 @@ def run_noise_study(
                 # Credal transformations.
                 for method in TRANSFORMATIONS:
                     bank = banks[method]
+                    model_index += 1
+                    progress_label = (
+                        f"noise_type={noise_type}, quality={quality}, rho={rho}, "
+                        f"repeat={repeat + 1}/{repeats}, method={method}"
+                    )
+                    print(
+                        f"[noise {model_index}/{total_models}] Training "
+                        f"{progress_label}...",
+                        flush=True,
+                    )
                     model = train_mlp(
                         x_train,
                         train_data.y,
@@ -1166,17 +1189,21 @@ def run_noise_study(
                     metrics = evaluate_model(
                         model, x_test, test_data.y, test_data.true_posterior, device
                     )
+                    print(
+                        f"[noise {model_index}/{total_models}] Finished "
+                        f"{progress_label}; accuracy={metrics['accuracy']:.4f}.",
+                        flush=True,
+                    )
                     rows.append({
                         "study": "noise",
-                        "overlap": overlap_name,
+                        "pairwise_distance": distance,
                         "noise_type": noise_type,
-                        "quality": quality_name,
-                        "target_mean_label_kl": target_kl,
+                        "rho": noisy.rho,
+                        "quality": quality,
                         "achieved_mean_label_kl": noisy.achieved_mean_kl,
                         "top1_agreement_with_bayes": noisy.top1_agreement_with_bayes,
-                        "noise_parameter": noisy.parameter_name,
-                        "noise_parameter_value": noisy.parameter_value,
                         "repeat": repeat,
+                        **seed_info,
                         "method": method,
                         "target_type": "credal",
                         "mean_credal_area": bank.mean_area,
@@ -1186,18 +1213,19 @@ def run_noise_study(
                     })
 
     df = pd.DataFrame(rows)
+    df["loss"] = train_config.loss_name
     quality_df = pd.DataFrame(quality_rows)
     df_path = output_dir / "noise_study.csv"
     quality_path = output_dir / "noise_quality_summary.csv"
     df.to_csv(df_path, index=False)
     quality_df.to_csv(quality_path, index=False)
-    print(f"Saved noise study to {df_path}")
-    print(f"Saved noise-quality summary to {quality_path}")
+    print(f"Saved noise study to {df_path}", flush=True)
+    print(f"Saved noise-quality summary to {quality_path}", flush=True)
     return df, quality_df
 
 
 # ============================================================
-# 10. Aggregation helpers
+# 9. Aggregation helpers
 # ============================================================
 
 
@@ -1216,39 +1244,66 @@ def aggregate_results(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataFra
 
 
 # ============================================================
-# 11. Main
+# 10. Main
 # ============================================================
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=str, default="results_credal_gaussian")
-    parser.add_argument("--n-train", type=int, default=3000)
+    parser.add_argument("--n-train", type=int, default=5000)
     parser.add_argument("--n-test", type=int, default=5000)
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=5,
+                        help="Number of independent data/model seeds (default: 5).")
+    parser.add_argument("--seeds", type=int, nargs="+",
+                        help="Explicit repeat seeds; overrides --repeats.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--credal-delta", type=float, default=DEFAULT_CREDAL_DELTA)
+    parser.add_argument("--delta-mode", choices=["fixed", "select", "matched"], default="fixed",
+                        help="Fixed delta, validation-optimal delta, or matched training-area study.")
+    parser.add_argument("--n-validation", type=int, default=1000,
+                        help="Samples held out from --n-train in select/matched modes.")
+    parser.add_argument("--scan-dir", type=Path,
+                        help="Optional completed select-run directory supplying area scans for matched mode.")
     parser.add_argument(
-        "--study",
-        choices=["overlap", "noise", "both"],
-        default="both",
+        "--loss",
+        choices=["cross_entropy", "kl"],
+        default="cross_entropy",
+        help=(
+            "Training loss. In credal mode, KL is minimized over the complete "
+            "credal set and can select an interior target."
+        ),
     )
     parser.add_argument(
-        "--corruption-kind",
-        choices=["class", "logit"],
-        default="class",
-        help="Third noise family: targeted class-mass shift or Gaussian logit noise.",
-    )
-    parser.add_argument(
-        "--temperature-direction",
-        choices=["overconfident", "underconfident"],
-        default="overconfident",
-        help="T<1 or T>1 for the temperature-noise study.",
+        "--rho-values", type=float, nargs=3, default=list(DEFAULT_RHO_VALUES),
+        help="Three distinct rho values in [0, 1]; sorted ascending for high/medium/low quality.",
     )
     args = parser.parse_args()
+    if args.seeds is not None:
+        args.repeats = len(args.seeds)
+    try:
+        args.seeds = resolve_seeds(args.repeats, args.seeds)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
+        quality_rhos = quality_rho_levels(args.rho_values)
+    except ValueError as error:
+        parser.error(str(error))
+    args.rho_values = list(quality_rhos.values())
+    if args.scan_dir is not None and args.delta_mode != "matched":
+        parser.error("--scan-dir is only valid with --delta-mode matched")
+    if args.scan_dir is not None and args.scan_dir.resolve() == Path(args.output_dir).resolve():
+        parser.error("Use a separate output directory; do not overwrite source scans")
+    if args.delta_mode in {"select", "matched"}:
+        if len(args.seeds) != 5:
+            parser.error("select/matched modes require exactly five distinct seeds")
+        if not 0 < args.n_validation < args.n_train:
+            parser.error("Require 0 < --n-validation < --n-train")
+        if args.epochs < 1 or args.n_test < 1:
+            parser.error("Selection requires positive --epochs and --n-test")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1261,12 +1316,14 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        loss_name=args.loss,
     )
 
     config_dump = {
-        "overlap_levels": OVERLAP_LEVELS,
-        "quality_target_kl": QUALITY_TARGET_KL,
-        "noise_study_overlap": NOISE_STUDY_OVERLAP,
+        "rho_values": args.rho_values,
+        "quality_rho": quality_rhos,
+        "noise_types": list(NOISE_TYPES),
+        "pairwise_distance": NOISE_PAIRWISE_DISTANCE,
         "transformations": TRANSFORMATIONS,
         "credal_delta": args.credal_delta,
         "n_train": args.n_train,
@@ -1274,47 +1331,67 @@ def main() -> None:
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "repeats": args.repeats,
+        "seeds": args.seeds,
+        "seed_schedule": {"noise": [experiment_seeds(seed) for seed in args.seeds]},
         "learning_rate": args.lr,
         "weight_decay": args.weight_decay,
-        "corruption_kind": args.corruption_kind,
-        "temperature_direction": args.temperature_direction,
+        "loss": args.loss,
+        "corruption_kind": "class",
     }
+    if args.delta_mode == "select":
+        from delta_search import UNIT_DELTA_GRID, run_delta_selection_study
+        config_dump["delta_selection"] = {
+            "mode": "select", "methods": ["pmm", "lv", "qcor", "tv"],
+            "n_validation": args.n_validation, "n_fit": args.n_train - args.n_validation,
+            "selection_metric": "mean_validation_accuracy", "tie_break": "smaller_delta",
+            "unit_delta_grid": list(UNIT_DELTA_GRID),
+            "pmm_initial_delta": 0.05, "pmm_initial_step": 0.05,
+            "pmm_step_growth": 1.5, "pmm_stop_metric": "mean_normalized_area",
+            "pmm_stop_rule": "delta >= pooled_training_Q95 AND adjacent_area_increment < 0.01",
+            "final_evaluation": "saved_fitting_subset_checkpoints_without_refit",
+        }
+    if args.delta_mode == "matched":
+        config_dump["matched_imprecision"] = {
+            "methods": ["pmm", "lv", "qcor", "tv"], "n_validation": args.n_validation,
+            "n_fit": args.n_train - args.n_validation, "epsilon_A": .005,
+            "n_tau": 5, "tau_grid": "linspace(common_min, common_max, 5), endpoints included",
+            "area_data": "noisy fitting labels only", "refinement": "linear interpolation then bisection",
+            "scan_dir": str(args.scan_dir.resolve()) if args.scan_dir else None,
+        }
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(config_dump, f, indent=2)
 
-    if args.study in {"overlap", "both"}:
-        overlap_df = run_overlap_study(
-            output_dir=output_dir,
-            n_train=args.n_train,
-            n_test=args.n_test,
-            repeats=args.repeats,
-            train_config=train_config,
-            credal_delta=args.credal_delta,
-            device=device,
+    if args.delta_mode == "matched":
+        from matched_imprecision import run_matched_study
+        run_matched_study(output_dir, args.n_train, args.n_test, args.seeds,
+                          train_config, device, args.rho_values, args.n_validation, args.scan_dir)
+        print("Done.")
+        return
+    if args.delta_mode == "select":
+        run_delta_selection_study(
+            output_dir=output_dir, n_train=args.n_train, n_test=args.n_test,
+            seeds=args.seeds, train_config=train_config, credal_delta=args.credal_delta,
+            device=device, rho_values=args.rho_values, n_validation=args.n_validation,
         )
-        overlap_summary = aggregate_results(
-            overlap_df,
-            group_cols=["overlap", "method", "target_type"],
-        )
-        overlap_summary.to_csv(output_dir / "overlap_study_summary.csv", index=False)
+        print("Done.")
+        return
 
-    if args.study in {"noise", "both"}:
-        noise_df, _quality_df = run_noise_study(
-            output_dir=output_dir,
-            n_train=args.n_train,
-            n_test=args.n_test,
-            repeats=args.repeats,
-            train_config=train_config,
-            credal_delta=args.credal_delta,
-            device=device,
-            corruption_kind=args.corruption_kind,
-            temperature_direction=args.temperature_direction,
-        )
-        noise_summary = aggregate_results(
-            noise_df,
-            group_cols=["noise_type", "quality", "method", "target_type"],
-        )
-        noise_summary.to_csv(output_dir / "noise_study_summary.csv", index=False)
+    noise_df, _quality_df = run_noise_study(
+        output_dir=output_dir,
+        n_train=args.n_train,
+        n_test=args.n_test,
+        repeats=args.repeats,
+        seeds=args.seeds,
+        train_config=train_config,
+        credal_delta=args.credal_delta,
+        device=device,
+        rho_values=args.rho_values,
+    )
+    noise_summary = aggregate_results(
+        noise_df,
+        group_cols=["noise_type", "quality", "rho", "loss", "method", "target_type"],
+    )
+    noise_summary.to_csv(output_dir / "noise_study_summary.csv", index=False)
 
     print("Done.")
 
