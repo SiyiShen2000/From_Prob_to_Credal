@@ -1,6 +1,7 @@
 """Compare accuracy and posterior KL for each noise type and rho."""
 
 import argparse
+import json
 import math
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # Save PNGs without requiring a GUI/Tk installation.
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import pandas as pd
 
 
@@ -93,7 +95,8 @@ def add_baselines(axis, baseline, noisy_soft, column, title):
 
 
 def make_plot(data, baseline, noise_type, rho, output=OUTPUT, *,
-              method_labels=None, study_title="Noise study", file_prefix="noise"):
+              method_labels=None, study_title="Noise study", file_prefix="noise",
+              area_legend=None):
     method_labels = METHOD_LABELS if method_labels is None else method_labels
     condition = data[
         data["noise_type"].eq(noise_type) & data["rho"].eq(rho)
@@ -113,8 +116,26 @@ def make_plot(data, baseline, noise_type, rho, output=OUTPUT, *,
         )
     noisy_soft = noisy_soft_rows.iloc[0]
     quality = noisy_soft["quality"]
+    losses = condition["loss"].dropna().unique() if "loss" in condition else []
+    if len(losses) > 1:
+        raise ValueError("Plot one training loss at a time")
+    loss_label = str(losses[0]) if len(losses) else "N/A"
+    neighborhoods = subset[subset.method.isin(("pmm", "lv", "qcor", "tv"))]
+    deltas = neighborhoods.get("credal_delta", pd.Series(dtype=float)).dropna().unique()
+    if len(deltas) == 1:
+        delta_label = f"δ={float(deltas[0]):g}"
+    elif len(deltas) > 1:
+        delta_label = "δ: " + ", ".join(
+            f"{row.method.upper()}={row.credal_delta:g}" for row in neighborhoods.itertuples())
+    else:
+        delta_label = "δ=N/A"
 
-    figure, axes = plt.subplots(1, 2, figsize=(13, 6))
+    if area_legend is None:
+        area_legend = subset.set_index("method")["mean_credal_area_mean"].to_dict()
+    if set(area_legend) != set(METHODS) or any(
+            not math.isfinite(float(v)) or not 0 <= float(v) <= 1 for v in area_legend.values()):
+        raise ValueError("Area legend requires finite values in [0, 1] for all methods")
+    figure, axes = plt.subplots(1, 2, figsize=(15, 6))
     metrics = [
         ("accuracy_mean", "Accuracy", "Accuracy (mean ± 1 SD across seeds)"),
         ("posterior_kl_mean", "Posterior KL", "Posterior KL (lower is better)"),
@@ -144,7 +165,7 @@ def make_plot(data, baseline, noise_type, rho, output=OUTPUT, *,
     note = "Accuracy: error bars and baseline bands show ±1 sample SD (not confidence intervals)."
     if std_rows["accuracy_std"].isna().any():
         note += "\nUndefined SD is omitted (e.g. only one repeat)."
-    figure.text(0.5, 0.025, note, ha="center", fontsize=9)
+    # figure.text(0.5, 0.025, note, ha="center", fontsize=9)
 
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
@@ -152,17 +173,43 @@ def make_plot(data, baseline, noise_type, rho, output=OUTPUT, *,
             handles,
             labels,
             loc="upper center",
-            bbox_to_anchor=(0.5, 0.91),
+            bbox_to_anchor=(0.5, 0.86),
             ncol=2,
             frameon=False,
         )
+    if area_legend:
+        if set(area_legend) != set(METHODS):
+            raise ValueError("Area legend must contain exactly the eight credal methods.")
+        area_handles = [
+            Patch(
+                facecolor=COLORS[method],
+                edgecolor="white",
+                label=f"{METHOD_LABELS[method]}: {area_legend[method]:.3f}",
+            )
+            for method in METHODS
+        ]
+        figure.legend(
+            handles=area_handles,
+            title="Mean normalized\ncredal-set area",
+            loc="center left",
+            bbox_to_anchor=(0.81, 0.49),
+            frameon=True,
+            fontsize=8,
+            title_fontsize=9,
+        )
     figure.suptitle(
-        f"{study_title}: {'Class corruption' if noise_type == 'corruption' else 'Uniform'} noise, {quality} label quality (rho={rho:g})",
+        f"{study_title}: {'Class corruption' if noise_type == 'corruption' else 'Uniform'} noise, {quality} label quality\n"
+        f"rho={rho:g}, loss={loss_label}, {delta_label}",
         fontsize=16,
         fontweight="bold",
         y=0.98,
     )
-    figure.subplots_adjust(top=0.72, bottom=0.30, wspace=0.24)
+    figure.subplots_adjust(
+        top=0.72,
+        bottom=0.30,
+        wspace=0.24,
+        right=0.79,
+    )
     figure.savefig(
         output / f"{file_prefix}_{noise_type}_{quality}_rho_{rho}.png",
         dpi=220,
@@ -177,6 +224,12 @@ def main():
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     data = pd.read_csv(args.input)
+    # Fixed-run summaries historically omit delta; use the actual run configuration.
+    config_path = args.input.parent / "config.json"
+    if "credal_delta" not in data and config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if "credal_delta" in config:
+            data["credal_delta"] = float(config["credal_delta"])
     if "rho" not in data.columns:
         raise ValueError("This CSV uses the old KL-calibrated format. Run the rho-based noise study first.")
     required = {"noise_type", "method", "accuracy_mean", "accuracy_std", "posterior_kl_mean"}

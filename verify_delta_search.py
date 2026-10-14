@@ -22,14 +22,17 @@ def main():
     seeds = list(range(5))
     splits = search.prepare_search_splits(12, 4, seeds)
     for split in splits:
-        assert not set(split.train_indices) & set(split.validation_indices)
-        assert len(set(split.train_indices) | set(split.validation_indices)) == 12
+        assert len(split.x_train) == 12 and len(split.x_validation) == 4
+        assert split.validation_seed not in (split.seed_info["train_seed"], split.seed_info["test_seed"])
         np.testing.assert_allclose(split.x_train.mean(0), 0, atol=1e-12)
         np.testing.assert_allclose(split.x_train.std(0), 1, atol=1e-12)
         pool = exp.generate_gmm_dataset(12, 2.5, seed=split.seed_info["train_seed"])
-        np.testing.assert_allclose(split.mean, pool.x[split.train_indices].mean(0, keepdims=True))
-        np.testing.assert_allclose(split.x_validation,
-                                   (pool.x[split.validation_indices] - split.mean) / split.std)
+        np.testing.assert_allclose(split.mean, pool.x.mean(0, keepdims=True))
+        validation = exp.generate_gmm_dataset(4, 2.5, seed=split.validation_seed)
+        np.testing.assert_allclose(split.x_validation, (validation.x - split.mean) / split.std)
+        np.testing.assert_array_equal(split.y_validation, validation.y)
+        np.testing.assert_allclose(split.x_train, (pool.x - split.mean) / split.std)
+        np.testing.assert_array_equal(split.p_train, pool.true_posterior)
     assert search.UNIT_DELTA_GRID == tuple(i * .05 for i in range(1, 20)) or np.allclose(search.UNIT_DELTA_GRID, np.arange(.05, 1, .05))
     labels = [np.array([[.2, .3, .5], [.1, .2, .7]])] * 5
     expected = np.quantile(np.concatenate([1 / p.min(1) - 1 for p in labels]), .95)
@@ -44,17 +47,23 @@ def main():
     assert np.all(np.diff(candidates) > 0)
     assert search.pmm_stop_reason(.5, .505, 1, 2) is None
     assert search.pmm_stop_reason(.5, .52, 2, 2) is None
-    assert search.pmm_stop_reason(.5, .505, 2, 2)
+    assert search.pmm_stop_reason(.5, .504, 2, 2)
 
     config = exp.TrainConfig(epochs=1, batch_size=8, hidden_dims=(8, 8), loss_name="kl")
     with tempfile.TemporaryDirectory(prefix="credal_delta_") as directory:
         out = Path(directory)
-        # Deterministic score test: choose across seeds, not the best single seed.
-        scores = iter([.99, .1, .1, .1, .1] + [.4] * 5 + [.4] * 5)
-        def evaluate(*args, **kwargs):
-            return {"accuracy": next(scores), "posterior_kl": 0.}
+        # Scores favor delta .1 in the seed mean, despite delta .05's best single seed.
+        counts = iter([4, 0, 0, 0, 0] + [2] * 5 + [2] * 5)
+        prediction_calls = []
+        def predict(model, x, device):
+            split = splits[len(prediction_calls) % 5]
+            prediction_calls.append(1)
+            predicted = (split.y_validation + 1) % 3
+            n_correct = next(counts)
+            predicted[:n_correct] = split.y_validation[:n_correct]
+            return np.eye(3)[predicted]
         with patch.object(search, "UNIT_DELTA_GRID", (.05, .1, .15)), \
-             patch.object(exp, "evaluate_model", evaluate), contextlib.redirect_stdout(io.StringIO()):
+             patch.object(exp, "predict_probabilities", predict), contextlib.redirect_stdout(io.StringIO()):
             selected, checkpoints, _ = search.search_condition(
                 splits, [s.p_train for s in splits], "lv",
                 dict(noise_type="uniform", quality="high", rho=.1),
@@ -75,29 +84,37 @@ def main():
              contextlib.redirect_stdout(io.StringIO()):
             data, optimal = search.run_delta_selection_study(
                 out, 12, 9, seeds, config, .5, device, (.1, .3, .5), n_validation=4)
-        assert len(generated) == 10 and len(data) == 280 and len(optimal) == 24
+        assert len(generated) == 15 and len(data) == 280 and len(optimal) == 24
+        credal_rows = data[data.target_type.eq("credal")]
+        assert credal_rows.qstar_trajectory_evaluated_count.eq(12).all()
+        assert credal_rows.qstar_trajectory_boundary_rate.between(0, 1).all()
+        assert data[data.target_type.eq("baseline")].qstar_trajectory_boundary_rate.isna().all()
         trials = pd.read_csv(out / "delta_search_trials.csv")
         summary = pd.read_csv(out / "delta_search_summary.csv")
+        assert {"qstar_trajectory_boundary_rate_mean",
+                "qstar_trajectory_boundary_count_mean"}.issubset(summary.columns)
         assert set(trials.method) == set(search.SEARCH_METHODS)
         assert trials.groupby(["noise_type", "quality", "method", "delta"]).size().eq(5).all()
-        assert data.n_fit.eq(8).all() and data.n_validation.eq(4).all()
+        assert data.n_fit.eq(12).all() and data.n_validation.eq(4).all()
         for row in optimal.itertuples():
             history = summary[(summary.noise_type == row.noise_type) &
                               (summary.quality == row.quality) & (summary.method == row.method)]
-            winner = history.sort_values(["validation_accuracy_mean", "delta"], ascending=[False, True]).iloc[0]
+            winner = history.sort_values(
+                ["validation_accuracy_mean", "delta"], ascending=[False, True]
+            ).iloc[0]
             assert np.isclose(row.optimal_delta, winner.delta)
             tested = data[(data.noise_type == row.noise_type) &
                           (data.quality == row.quality) & (data.method == row.method)]
             assert len(tested) == 5 and np.allclose(tested.credal_delta, row.optimal_delta)
             if row.method == "pmm":
                 last = history.iloc[-1]
-                assert last.delta >= last.pmm_q95 and last.A_increment < .01
+                assert last.delta >= last.pmm_q95 and last.A_increment < .005
                 np.testing.assert_allclose(history.A_bar, history.mean_credal_area)
         with patch.object(sys, "argv", ["plot_noise_study.py", "--input", str(out / "noise_study_summary.csv")]), \
              contextlib.redirect_stdout(io.StringIO()):
             plots.main()
         assert len(list((out / "noise_plots").glob("*.png"))) == 6
-    print("PASS: five-seed splits, Q95, AND stopping, shared selection/ties, test isolation, KL integration, six plots")
+    print("PASS: independent clean validation, full training sets, mean accuracy selection/ties, Q95/area stopping, test isolation, KL integration, six plots")
 
 
 if __name__ == "__main__":

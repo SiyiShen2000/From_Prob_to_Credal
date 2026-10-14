@@ -1,14 +1,39 @@
 """Training-area matching, independent of validation/test performance."""
-import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 import credal_gaussian_experiment as exp
-import delta_search as search
+import credal_area_scan as search
 
 EPSILON_A = .005
+
+
+@dataclass
+class TrainingData:
+    repeat: int
+    seed_info: dict
+    x_train: np.ndarray
+    y_train: np.ndarray
+    p_train: np.ndarray
+    mean: np.ndarray
+    std: np.ndarray
+
+
+def prepare_training_data(n_train, seeds):
+    if n_train < 1 or len(seeds) != 5 or len(set(seeds)) != 5:
+        raise ValueError("Require positive n_train and five distinct seeds")
+    result = []
+    for repeat, seed in enumerate(seeds):
+        info = exp.experiment_seeds(seed)
+        data = exp.generate_gmm_dataset(n_train, exp.NOISE_PAIRWISE_DISTANCE, seed=info["train_seed"])
+        mean, std = data.x.mean(axis=0, keepdims=True), data.x.std(axis=0, keepdims=True)
+        std = np.where(std < 1e-12, 1., std)
+        result.append(TrainingData(repeat, info, (data.x - mean) / std,
+                                   data.y, data.true_posterior, mean, std))
+    return result
 
 
 def mean_area(labels, method, delta):
@@ -51,8 +76,10 @@ def refine_delta(curve, tau, area_function, epsilon=EPSILON_A):
     raise RuntimeError(f"Area refinement failed: tau={tau}, area={actual}; check scan provenance")
 
 
-def common_targets(scans, seeds):
+def common_targets(scans, seeds, n_tau=9):
     """Intersect all four methods x five seeds, separately for each condition."""
+    if n_tau < 2:
+        raise ValueError("Require at least two tau targets")
     ranges, targets = [], []
     for (noise, quality, rho), condition in scans.groupby(["noise_type", "quality", "rho"]):
         intervals = []
@@ -74,7 +101,7 @@ def common_targets(scans, seeds):
         low, high = max(a for a, _ in intervals), min(b for _, b in intervals)
         if high - low <= 1e-12:
             raise ValueError(f"No nondegenerate common area interval for {noise}/{quality}: [{low}, {high}]")
-        for index, tau in enumerate(np.linspace(low, high, 5)):
+        for index, tau in enumerate(np.linspace(low, high, n_tau)):
             targets.append(dict(noise_type=noise, quality=quality, rho=rho,
                                 tau_index=index, tau=float(tau), common_area_min=low,
                                 common_area_max=high))
@@ -105,51 +132,26 @@ def scan_areas(splits, labels_by_condition):
     return pd.DataFrame(rows)
 
 
-def load_scans(directory, splits, n_train, n_validation, rho_values):
-    """Reuse selection scans only when configuration and exact split indices match."""
-    directory = Path(directory)
-    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
-    seeds = [s.seed_info["seed"] for s in splits]
-    if (config.get("seeds") != seeds or config.get("n_train") != n_train
-            or config.get("delta_selection", {}).get("n_validation") != n_validation
-            or config.get("pairwise_distance") != exp.NOISE_PAIRWISE_DISTANCE
-            or config.get("corruption_kind") != "class"
-            or config.get("rho_values") != list(exp.quality_rho_levels(rho_values).values())):
-        raise ValueError("Scan configuration does not match current seeds/data/noise settings")
-    with np.load(directory / "validation_split_indices.npz") as indices:
-        for split in splits:
-            for kind, ids in (("train", split.train_indices), ("validation", split.validation_indices)):
-                if not np.array_equal(indices[f"seed_{split.seed_info['seed']}_{kind}"], ids):
-                    raise ValueError("Scan training/validation split mismatch")
-    scans = pd.read_csv(directory / "delta_search_trials.csv")
-    required = {"noise_type", "quality", "rho", "method", "seed", "delta", "mean_credal_area"}
-    if not required.issubset(scans.columns):
-        raise ValueError(f"Scan is missing columns: {required - set(scans.columns)}")
-    return scans
-
-
 def run_matched_study(output_dir, n_train, n_test, seeds, train_config, device,
-                      rho_values, n_validation=1000, scan_dir=None):
+                      rho_values, n_tau=9):
     output_dir = Path(output_dir)
     if train_config.epochs < 1 or n_test < 1:
         raise ValueError("Require positive training epochs and test size")
-    splits = search.prepare_search_splits(n_train, n_validation, seeds)
+    if n_tau < 2:
+        raise ValueError("Require at least two tau targets")
+    splits = prepare_training_data(n_train, seeds)
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(output_dir / "validation_split_indices.npz", **{
-        f"seed_{s.seed_info['seed']}_{kind}": ids for s in splits
-        for kind, ids in (("train", s.train_indices), ("validation", s.validation_indices))})
     labels = {
         (noise, quality, rho): [exp.make_noisy_probabilistic_labels(s.p_train, noise, rho).probabilities
                                 for s in splits]
         for noise in exp.NOISE_TYPES for quality, rho in exp.quality_rho_levels(rho_values).items()
     }
-    scans = (load_scans(scan_dir, splits, n_train, n_validation, rho_values) if scan_dir
-             else scan_areas(splits, labels))
+    scans = scan_areas(splits, labels)
     observed = set(scans[["noise_type", "quality", "rho"]].itertuples(index=False, name=None))
     if observed != set(labels) or set(scans.seed) != set(seeds) or set(scans.method) != set(search.SEARCH_METHODS):
         raise ValueError("Scan conditions, methods or seeds do not match this experiment")
     scans.to_csv(output_dir / "matched_area_scan.csv", index=False)
-    ranges, targets = common_targets(scans, seeds)
+    ranges, targets = common_targets(scans, seeds, n_tau)
     ranges.to_csv(output_dir / "matched_area_ranges.csv", index=False)
     targets.to_csv(output_dir / "matched_tau_targets.csv", index=False)
     matches = []
@@ -163,12 +165,12 @@ def run_matched_study(output_dir, n_train, n_test, seeds, train_config, device,
                 delta, area, initial, evaluations = refine_delta(
                     curve, target["tau"], lambda d: mean_area(p, method, d))
                 matches.append(dict(**target, method=method, **split.seed_info,
-                                    repeat=split.repeat, split_seed=split.split_seed,
+                                    repeat=split.repeat,
                                     delta=delta, interpolated_delta=initial, mean_credal_area=area,
                                     area_error=abs(area - target["tau"]), area_evaluations=evaluations))
         pd.DataFrame(matches).to_csv(output_dir / "matched_deltas.csv", index=False)
         print(f"[matched] {key} tau={target['tau']:.6f}: all 20 deltas verified", flush=True)
-    rows = []
+    rows, reference_rows = [], []
     for split in splits:
         test = exp.generate_gmm_dataset(n_test, exp.NOISE_PAIRWISE_DISTANCE, seed=split.seed_info["test_seed"])
         x_test = (test.x - split.mean) / split.std
@@ -180,20 +182,58 @@ def run_matched_study(output_dir, n_train, n_test, seeds, train_config, device,
                                            match["method"], match["delta"], device)
             if abs(bank.mean_area - match["tau"]) >= EPSILON_A:
                 raise RuntimeError("Final training bank failed area tolerance")
+            qstar_stats = {}
             model = exp.train_mlp(split.x_train, split.y_train, mode="credal", config=train_config,
-                                 device=device, seed=split.seed_info["model_seed"], vertex_bank=bank)
+                                 device=device, seed=split.seed_info["model_seed"], vertex_bank=bank,
+                                 qstar_statistics=qstar_stats)
             metrics = exp.evaluate_model(model, x_test, test.y, test.true_posterior, device)
             rows.append(dict(**match, study="matched_imprecision", loss=train_config.loss_name,
-                             n_fit=len(split.x_train), n_validation=n_validation, n_test=n_test,
-                             **metrics))
+                             n_fit=len(split.x_train), n_validation=0, n_test=n_test,
+                             true_posterior_coverage=bank.true_posterior_coverage,
+                             **qstar_stats, **metrics))
             pd.DataFrame(rows).to_csv(output_dir / "matched_study.csv", index=False)
             print(f"[matched test {len(rows)}/{len(matches)}] {key}/{match['method']} "
                   f"seed={match['seed']} tau={match['tau']:.4f} accuracy={metrics['accuracy']:.4f}", flush=True)
             del model, bank
+        # References are trained once per applicable condition/seed, never per tau.
+        tasks = [("baseline", "baseline", np.nan, "clean_sampled_hard", "hard", None),
+                 ("baseline", "baseline", np.nan, "oracle_posterior", "soft", split.p_train)]
+        for (noise, quality, rho), noisy_arrays in labels.items():
+            noisy = noisy_arrays[split.repeat]
+            tasks.append((noise, quality, rho, "noisy_soft", "soft", noisy))
+            tasks.extend((noise, quality, rho, method, "credal", noisy)
+                         for method in exp.TRANSFORMATIONS if method not in search.SEARCH_METHODS)
+        for noise, quality, rho, method, mode, targets_for_training in tasks:
+            bank = (exp.prepare_vertex_bank(targets_for_training, split.p_train, method,
+                                            exp.DEFAULT_CREDAL_DELTA, device)
+                    if mode == "credal" else None)
+            stats = {} if bank is not None else exp.unavailable_qstar_statistics()
+            model = exp.train_mlp(split.x_train, split.y_train, mode=mode, config=train_config,
+                                 device=device, seed=split.seed_info["model_seed"], vertex_bank=bank,
+                                 soft_targets=targets_for_training if mode == "soft" else None,
+                                 qstar_statistics=stats if bank is not None else None)
+            metrics = exp.evaluate_model(model, x_test, test.y, test.true_posterior, device)
+            reference_rows.append(dict(noise_type=noise, quality=quality, rho=rho, method=method,
+                                       loss=train_config.loss_name, repeat=split.repeat, **split.seed_info,
+                                       n_fit=n_train, n_validation=0, n_test=n_test,
+                                       mean_credal_area=bank.mean_area if bank is not None else np.nan,
+                                       true_posterior_coverage=bank.true_posterior_coverage if bank is not None else np.nan,
+                                       **stats, **metrics))
+            pd.DataFrame(reference_rows).to_csv(output_dir / "matched_references.csv", index=False)
+            print(f"[matched reference] seed={split.seed_info['seed']} {noise}/{quality}/{method} "
+                  f"accuracy={metrics['accuracy']:.4f}", flush=True)
+            del model, bank
     data = pd.DataFrame(rows)
     groups = ["noise_type", "quality", "rho", "loss", "method", "tau_index", "tau"]
-    metrics = ["accuracy", "posterior_kl", "mean_credal_area", "delta", "area_error"]
+    metrics = ["accuracy", "posterior_kl", "mean_credal_area", "delta", "area_error", "true_posterior_coverage",
+               "qstar_trajectory_boundary_count", "qstar_trajectory_evaluated_count",
+               "qstar_trajectory_boundary_rate"]
     summary = data.groupby(groups)[metrics].agg(["mean", "std"])
     summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
     summary.reset_index().to_csv(output_dir / "matched_study_summary.csv", index=False)
+    references = pd.DataFrame(reference_rows)
+    reference_summary = references.groupby(["noise_type", "quality", "rho", "loss", "method"],
+                                           dropna=False)[[m for m in metrics if m not in ("delta", "area_error")]].agg(["mean", "std"])
+    reference_summary.columns = [f"{metric}_{stat}" for metric, stat in reference_summary.columns]
+    reference_summary.reset_index().to_csv(output_dir / "matched_references_summary.csv", index=False)
     return data

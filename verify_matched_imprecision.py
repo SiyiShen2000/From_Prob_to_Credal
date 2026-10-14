@@ -11,7 +11,8 @@ import pandas as pd
 import torch
 
 import credal_gaussian_experiment as exp
-import delta_search as search
+import credal_area_scan as search
+import plot_delta_matched_study as plotter
 import matched_imprecision as matched
 
 
@@ -35,7 +36,7 @@ def main():
             for d, a in ((.05, .1 if s != 4 else .2), (.95, .8 if m != "tv" else .7))]
     ranges, targets = matched.common_targets(pd.DataFrame(rows), list(range(5)))
     assert len(ranges) == 20
-    np.testing.assert_allclose(targets.tau, np.linspace(.2, .7, 5))
+    np.testing.assert_allclose(targets.tau, np.linspace(.2, .7, 9))
     bad = pd.DataFrame(rows)
     bad.loc[(bad.seed == 4) & (bad.method == "pmm"), "mean_credal_area"] = [.8, .9]
     try:
@@ -50,42 +51,45 @@ def main():
         calls = []
         def generate(*args, **kwargs):
             if kwargs["seed"] in {exp.experiment_seeds(s)["test_seed"] for s in range(5)}:
-                assert len(pd.read_csv(out / "matched_deltas.csv")) == 600
+                assert len(pd.read_csv(out / "matched_deltas.csv")) == 240
             return real_generate(*args, **kwargs)
         def train(*args, **kwargs):
-            assert len(args[0]) == 6
-            assert len(pd.read_csv(out / "matched_deltas.csv")) == 600
+            assert len(args[0]) == 9
+            assert len(pd.read_csv(out / "matched_deltas.csv")) == 240
             calls.append(kwargs["seed"])
             return real_train(*args, **kwargs)
         config = exp.TrainConfig(epochs=1, batch_size=8, hidden_dims=(8, 8), loss_name="kl")
         with patch.object(exp, "generate_gmm_dataset", generate), patch.object(exp, "train_mlp", train), \
              patch.object(search, "UNIT_DELTA_GRID", (.05, .5, .95)), contextlib.redirect_stdout(io.StringIO()):
             data = matched.run_matched_study(out, 9, 7, list(range(5)), config, torch.device("cpu"),
-                                             (.1, .3, .5), n_validation=3)
-        assert len(data) == len(calls) == 600
+                                             (.1, .3, .5), n_tau=2)
+        assert len(data) == 240 and len(calls) == 400
+        assert data.n_fit.eq(9).all() and data.n_validation.eq(0).all()
+        assert not (out / 'validation_split_indices.npz').exists()
         assert (data.area_error < .005).all()
+        assert data.qstar_trajectory_evaluated_count.eq(9).all()
+        assert data.qstar_trajectory_boundary_rate.between(0, 1).all()
         assert data.groupby(["noise_type", "quality", "tau_index"]).tau.nunique().eq(1).all()
         summary = pd.read_csv(out / "matched_study_summary.csv")
-        assert len(summary) == 120 and summary.accuracy_std.notna().all()
+        assert len(summary) == 48 and summary.accuracy_std.notna().all()
+        assert summary.qstar_trajectory_boundary_rate_mean.between(0, 1).all()
         expected = data.groupby(["noise_type", "quality", "rho", "loss", "method", "tau_index", "tau"]).accuracy.std()
         np.testing.assert_allclose(summary.accuracy_std, expected.to_numpy())
-        # Exercise compatible select-scan loading and mismatched-config rejection.
-        scans = pd.read_csv(out / "matched_area_scan.csv")
-        scans.to_csv(out / "delta_search_trials.csv", index=False)
-        source_config = {"seeds": list(range(5)), "n_train": 9,
-                         "delta_selection": {"n_validation": 3}, "pairwise_distance": 2.5,
-                         "corruption_kind": "class", "rho_values": [.1, .3, .5]}
-        # A temporary fixture, not a project-file edit.
-        with (out / "config.json").open("w", encoding="utf-8") as handle:
-            json.dump(source_config, handle)
-        splits = search.prepare_search_splits(9, 3, list(range(5)))
-        assert len(matched.load_scans(out, splits, 9, 3, (.1, .3, .5))) == len(scans)
-        try:
-            matched.load_scans(out, splits, 10, 3, (.1, .3, .5))
-            raise AssertionError("Mismatched training size accepted")
-        except ValueError:
-            pass
-    print("PASS: common intervals, five taus, interpolation/refinement, 600 real KL fits, test isolation, summaries, scan reuse")
+        references = pd.read_csv(out / "matched_references.csv")
+        assert len(references) == 160
+        assert references.n_fit.eq(9).all() and references.n_validation.eq(0).all()
+        assert not references.duplicated(["noise_type", "quality", "rho", "method", "seed"]).any()
+        credal_references = references[references.method.isin(exp.TRANSFORMATIONS)]
+        assert credal_references.qstar_trajectory_evaluated_count.eq(9).all()
+        reference_summary = pd.read_csv(out / "matched_references_summary.csv")
+        assert len(reference_summary) == 32
+        expected_refs = references.groupby(["noise_type", "quality", "rho", "loss", "method"],
+                                          dropna=False).accuracy.std()
+        np.testing.assert_allclose(reference_summary.accuracy_std, expected_refs.to_numpy())
+        assert plotter.plot_study(summary, out / "plots", reference_summary) == 6
+        assert len(list((out / "plots").glob("*.png"))) == 6
+        assert not list(out.rglob("*best_tau*"))
+    print("PASS: 400 real KL fits, all training samples, model-free scans/test isolation, references, summaries and six curves")
 
 
 if __name__ == "__main__":

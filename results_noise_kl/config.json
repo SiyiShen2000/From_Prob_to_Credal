@@ -74,5 +74,10 @@
   "learning_rate": 0.001,
   "weight_decay": 0.0001,
   "loss": "kl",
-  "corruption_kind": "class"
+  "corruption_kind": "class",
+  "qstar_trajectory_diagnostic": {
+    "event_scope": "every fitting-sample q_star selection in every training epoch",
+    "simplex_boundary_rule": "min_c(q_star_c) <= 1e-7",
+    "edge_tolerance": 1e-07
+  }
 }

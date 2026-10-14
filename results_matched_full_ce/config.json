@@ -1,0 +1,100 @@
+{
+  "rho_values": [
+    0.1,
+    0.3,
+    0.5
+  ],
+  "quality_rho": {
+    "high": 0.1,
+    "medium": 0.3,
+    "low": 0.5
+  },
+  "noise_types": [
+    "uniform",
+    "corruption"
+  ],
+  "pairwise_distance": 2.5,
+  "transformations": [
+    "alpha_cut",
+    "inverse_pignistic",
+    "dubois_prade",
+    "pmm",
+    "lv",
+    "qcor",
+    "tv",
+    "comparative"
+  ],
+  "credal_delta": 0.5,
+  "n_train": 5000,
+  "n_test": 5000,
+  "epochs": 120,
+  "batch_size": 128,
+  "repeats": 5,
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "seed_schedule": {
+    "noise": [
+      {
+        "seed": 0,
+        "train_seed": 3964924996,
+        "test_seed": 1358922860,
+        "model_seed": 3894904162
+      },
+      {
+        "seed": 1,
+        "train_seed": 1189033389,
+        "test_seed": 18114953,
+        "model_seed": 1526455747
+      },
+      {
+        "seed": 2,
+        "train_seed": 307626447,
+        "test_seed": 1538850434,
+        "model_seed": 3092219749
+      },
+      {
+        "seed": 3,
+        "train_seed": 457190280,
+        "test_seed": 2660306227,
+        "model_seed": 859341110
+      },
+      {
+        "seed": 4,
+        "train_seed": 2570931004,
+        "test_seed": 703397822,
+        "model_seed": 843209393
+      }
+    ]
+  },
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "loss": "cross_entropy",
+  "corruption_kind": "class",
+  "qstar_trajectory_diagnostic": {
+    "event_scope": "every fitting-sample q_star selection in every training epoch",
+    "simplex_boundary_rule": "min_c(q_star_c) <= 1e-7",
+    "edge_tolerance": 1e-07
+  },
+  "matched_imprecision": {
+    "methods": [
+      "pmm",
+      "lv",
+      "qcor",
+      "tv"
+    ],
+    "n_validation": 0,
+    "n_fit": 5000,
+    "epsilon_A": 0.005,
+    "independent": true,
+    "n_tau": 9,
+    "tau_grid": "linspace(common_min, common_max, n_tau), endpoints included",
+    "area_data": "all noisy training labels; no models trained during scan",
+    "refinement": "linear interpolation then bisection",
+    "references": "all other credal methods and hard/oracle/noisy-soft baselines"
+  }
+}

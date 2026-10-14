@@ -13,7 +13,8 @@ INPUT = Path(__file__).resolve().parent / "results_delta_kl" / "noise_study_summ
 
 def plot_study(data, output):
     required = {"noise_type", "quality", "rho", "method", "accuracy_mean",
-                "accuracy_std", "posterior_kl_mean", "credal_delta", "delta_mode"}
+                "accuracy_std", "posterior_kl_mean", "credal_delta", "delta_mode",
+                "mean_credal_area_mean"}
     if not required.issubset(data.columns):
         raise ValueError(f"Expected select noise_study_summary.csv; missing {required - set(data.columns)}")
     if set(data.delta_mode.dropna()) != {"select"}:
@@ -29,6 +30,15 @@ def plot_study(data, output):
         if noise not in base.NOISE_TYPES:
             raise ValueError(f"Unknown noise type: {noise}")
         labels = dict(base.METHOD_LABELS)
+        area_legend = {}
+        for method in base.METHODS:
+            rows = condition[condition.method.eq(method)]
+            if len(rows) != 1:
+                raise ValueError(f"Expected one result row for {noise}/{quality}/{method}")
+            area = float(rows.iloc[0].mean_credal_area_mean)
+            if not np.isfinite(area) or not 0 <= area <= 1:
+                raise ValueError(f"Invalid mean normalized credal-set area: {method}={area}")
+            area_legend[method] = area
         for method in METHODS:
             rows = condition[condition.method.eq(method)]
             if len(rows) != 1:
@@ -38,7 +48,8 @@ def plot_study(data, output):
                 raise ValueError(f"Invalid selected delta: {method}={delta}")
             labels[method] = f"{base.METHOD_LABELS[method]} (δ*={delta:.6g})"
         base.make_plot(data, baseline, noise, rho, output, method_labels=labels,
-                       study_title="Optimal delta study", file_prefix="delta_select")
+                       study_title="Optimal delta study", file_prefix="delta_select",
+                       area_legend=area_legend)
         count += 1
     if count == 0:
         raise ValueError("No experimental conditions found")

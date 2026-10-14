@@ -146,10 +146,6 @@ def generate_gmm_dataset(
         X | Y=c ~ N(mu_c, Sigma_c)
 
     The exact posterior P(Y|X=x) is then computed analytically.
-
-    Calling this function with the same seed but a different pairwise_distance
-    reuses the same latent labels and Gaussian residual draws, so overlap is the
-    main changed factor.
     """
     rng = np.random.default_rng(seed)
     priors = np.full(N_CLASSES, 1.0 / N_CLASSES)
@@ -190,12 +186,6 @@ def rowwise_kl(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return np.sum(p_safe * (np.log(p_safe) - np.log(q_safe)), axis=1)
 
 
-def softmax_np(z: np.ndarray) -> np.ndarray:
-    z = z - z.max(axis=1, keepdims=True)
-    ez = np.exp(z)
-    return ez / ez.sum(axis=1, keepdims=True)
-
-
 def uniform_mixing(p: np.ndarray, rho: float) -> np.ndarray:
     u = np.full_like(p, 1.0 / p.shape[1])
     return (1.0 - rho) * p + rho * u
@@ -226,7 +216,7 @@ def make_noisy_probabilistic_labels(
     noise_type: str,
     rho: float,
 ) -> NoisyLabelResult:
-    """Apply a specified mixing proportion; KL is diagnostic only."""
+    """Apply a specified mixing proportion."""
     if not np.isfinite(rho) or not 0.0 <= rho <= 1.0:
         raise ValueError("rho must be finite and between 0 and 1")
     if noise_type == "uniform":
@@ -335,7 +325,7 @@ def _possibility_constraints_from_sorted_values(
         q_{sigma(3)} <= pi_3,
         q_{sigma(2)} + q_{sigma(3)} <= pi_2.
     """
-    order = np.argsort(-p, kind="stable")
+    order = np.argsort(-p, kind="stable") # Descending order
     ps = p[order]
     p2, p3 = ps[1], ps[2]
 
@@ -699,6 +689,18 @@ def minimum_kl_target_in_credal_set(
         constraints_satisfied = (lhs <= b_ub + feasibility_tol) | ~constraint_mask
         feasible = constraints_satisfied.all(dim=1)
 
+    # KL(q || prediction) is zero at q=prediction. Feasible predictions are
+    # therefore already exact minimizers and must not enter the costly segment
+    # search. Keep their answers in place and compact only infeasible rows.
+    q_star = probs.clone()
+    infeasible_ids = torch.nonzero(~feasible, as_tuple=False).squeeze(1)
+    if infeasible_ids.numel() == 0:
+        return q_star.detach()
+
+    log_probs = log_probs[infeasible_ids]
+    vertices = vertices[infeasible_ids]
+    vertex_mask = vertex_mask[infeasible_ids]
+
     # Vertices cover singleton credal sets and provide stable endpoint candidates.
     vertex_kl = categorical_loss_from_log_probs(
         vertices,
@@ -752,8 +754,49 @@ def minimum_kl_target_in_credal_set(
         use_segment = best_segment_kl < best_kl
         best_q = torch.where(use_segment[:, None], best_segment_q, best_q)
 
-    # KL(q || p) is zero at q=p, so a feasible prediction is the global optimum.
-    return torch.where(feasible[:, None], probs, best_q).detach()
+    q_star[infeasible_ids] = best_q
+    return q_star.detach()
+
+
+@torch.no_grad()
+def select_credal_target(
+    log_probs: torch.Tensor,
+    vertex_bank: VertexBank,
+    ids: torch.Tensor,
+    loss_name: str,
+) -> torch.Tensor:
+    """Select q_star exactly as credal training does for one indexed batch."""
+    vertices = vertex_bank.vertices[ids]
+    vertex_mask = vertex_bank.mask[ids]
+    if loss_name == "cross_entropy":
+        losses = categorical_loss_from_log_probs(
+            vertices, log_probs.detach()[:, None, :], "cross_entropy"
+        ).masked_fill(~vertex_mask, float("inf"))
+        best_idx = torch.argmin(losses, dim=1)
+        return vertices[torch.arange(len(ids), device=ids.device), best_idx]
+    if loss_name == "kl":
+        return minimum_kl_target_in_credal_set(
+            log_probs=log_probs.detach(),
+            vertices=vertices,
+            vertex_mask=vertex_mask,
+            A_ub=vertex_bank.A_ub[ids],
+            b_ub=vertex_bank.b_ub[ids],
+            constraint_mask=vertex_bank.constraint_mask[ids],
+        )
+    raise ValueError("loss_name must be 'cross_entropy' or 'kl'")
+
+
+QSTAR_BOUNDARY_TOLERANCE = 1e-7
+
+
+def unavailable_qstar_statistics() -> Dict[str, float]:
+    """Placeholder for hard/soft models, which never select a credal q_star."""
+    return {
+        "qstar_trajectory_boundary_count": np.nan,
+        "qstar_trajectory_evaluated_count": np.nan,
+        "qstar_trajectory_boundary_rate": np.nan,
+        "qstar_boundary_tolerance": np.nan,
+    }
 
 
 def train_mlp(
@@ -765,6 +808,7 @@ def train_mlp(
     seed: int,
     soft_targets: Optional[np.ndarray] = None,
     vertex_bank: Optional[VertexBank] = None,
+    qstar_statistics: Optional[Dict[str, object]] = None,
 ) -> SimpleMLP:
     """
     mode:
@@ -796,6 +840,8 @@ def train_mlp(
 
     n = len(x_train)
     rng = np.random.default_rng(seed + 12345)
+    boundary_count = torch.zeros((), dtype=torch.long, device=device)
+    qstar_evaluated_count = 0
 
     for _epoch in range(config.epochs):
         permutation = rng.permutation(n)
@@ -832,33 +878,13 @@ def train_mlp(
                 if vertex_bank is None:
                     raise ValueError("vertex_bank is required in credal mode")
 
-                # V_b: [B, Vmax, C]
-                V_b = vertex_bank.vertices[ids]
-                mask_b = vertex_bank.mask[ids]
-                if config.loss_name == "cross_entropy":
-                    # CE is linear in q, so a minimum over the full convex set
-                    # is attained at a vertex.
-                    losses_all = categorical_loss_from_log_probs(
-                        V_b,
-                        log_probs[:, None, :],
-                        "cross_entropy",
-                    ).masked_fill(~mask_b, float("inf"))
-                    best_idx = torch.argmin(losses_all, dim=1)
-                    q_star = V_b[
-                        torch.arange(len(ids), device=device),
-                        best_idx,
-                    ].detach()
-                else:
-                    # KL is convex rather than linear in q. Its minimum can be
-                    # inside the credal set, so optimize over the full polygon.
-                    q_star = minimum_kl_target_in_credal_set(
-                        log_probs=log_probs,
-                        vertices=V_b,
-                        vertex_mask=mask_b,
-                        A_ub=vertex_bank.A_ub[ids],
-                        b_ub=vertex_bank.b_ub[ids],
-                        constraint_mask=vertex_bank.constraint_mask[ids],
-                    )
+                q_star = select_credal_target(
+                    log_probs, vertex_bank, ids, config.loss_name
+                )
+                boundary_count += (
+                    q_star.amin(dim=1) <= QSTAR_BOUNDARY_TOLERANCE
+                ).sum()
+                qstar_evaluated_count += len(q_star)
 
                 # Stop-gradient target q_star; gradient flows only through logits.
                 loss = categorical_loss_from_log_probs(
@@ -871,6 +897,22 @@ def train_mlp(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+
+    if qstar_statistics is not None:
+        qstar_statistics.clear()
+        if mode == "credal":
+            count = int(boundary_count.item())
+            qstar_statistics.update({
+                "qstar_trajectory_boundary_count": count,
+                "qstar_trajectory_evaluated_count": qstar_evaluated_count,
+                "qstar_trajectory_boundary_rate": (
+                    count / qstar_evaluated_count
+                    if qstar_evaluated_count else np.nan
+                ),
+                "qstar_boundary_tolerance": QSTAR_BOUNDARY_TOLERANCE,
+            })
+        else:
+            qstar_statistics.update(unavailable_qstar_statistics())
 
     return model
 
@@ -1030,6 +1072,7 @@ def run_noise_study(
             "target_type": "baseline",
             "mean_credal_area": np.nan,
             "true_posterior_coverage": np.nan,
+            **unavailable_qstar_statistics(),
             **bayes,
             **metrics,
         })
@@ -1072,6 +1115,7 @@ def run_noise_study(
             "target_type": "baseline",
             "mean_credal_area": np.nan,
             "true_posterior_coverage": np.nan,
+            **unavailable_qstar_statistics(),
             **bayes,
             **metrics,
         })
@@ -1160,6 +1204,7 @@ def run_noise_study(
                     "target_type": "baseline",
                     "mean_credal_area": np.nan,
                     "true_posterior_coverage": np.nan,
+                    **unavailable_qstar_statistics(),
                     **bayes,
                     **metrics,
                 })
@@ -1167,6 +1212,7 @@ def run_noise_study(
                 # Credal transformations.
                 for method in TRANSFORMATIONS:
                     bank = banks[method]
+                    qstar_stats: Dict[str, object] = {}
                     model_index += 1
                     progress_label = (
                         f"noise_type={noise_type}, quality={quality}, rho={rho}, "
@@ -1185,6 +1231,7 @@ def run_noise_study(
                         config=train_config,
                         device=device,
                         seed=model_seed,
+                        qstar_statistics=qstar_stats,
                     )
                     metrics = evaluate_model(
                         model, x_test, test_data.y, test_data.true_posterior, device
@@ -1208,6 +1255,7 @@ def run_noise_study(
                         "target_type": "credal",
                         "mean_credal_area": bank.mean_area,
                         "true_posterior_coverage": bank.true_posterior_coverage,
+                        **qstar_stats,
                         **bayes,
                         **metrics,
                     })
@@ -1236,6 +1284,9 @@ def aggregate_results(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataFra
         "posterior_brier",
         "mean_credal_area",
         "true_posterior_coverage",
+        "qstar_trajectory_boundary_count",
+        "qstar_trajectory_evaluated_count",
+        "qstar_trajectory_boundary_rate",
     ]
     existing = [c for c in metric_cols if c in df.columns]
     agg = df.groupby(list(group_cols), dropna=False)[existing].agg(["mean", "std"])
@@ -1264,10 +1315,10 @@ def main() -> None:
     parser.add_argument("--credal-delta", type=float, default=DEFAULT_CREDAL_DELTA)
     parser.add_argument("--delta-mode", choices=["fixed", "select", "matched"], default="fixed",
                         help="Fixed delta, validation-optimal delta, or matched training-area study.")
-    parser.add_argument("--n-validation", type=int, default=1000,
-                        help="Samples held out from --n-train in select/matched modes.")
-    parser.add_argument("--scan-dir", type=Path,
-                        help="Optional completed select-run directory supplying area scans for matched mode.")
+    parser.add_argument("--n-validation", type=int, default=100,
+                        help="Additional independent clean-hard validation samples per seed, select mode only.")
+    parser.add_argument("--n-tau", type=int, default=9,
+                        help="Number of matched training-area targets per condition (default: 9).")
     parser.add_argument(
         "--loss",
         choices=["cross_entropy", "kl"],
@@ -1293,19 +1344,23 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
     args.rho_values = list(quality_rhos.values())
-    if args.scan_dir is not None and args.delta_mode != "matched":
-        parser.error("--scan-dir is only valid with --delta-mode matched")
-    if args.scan_dir is not None and args.scan_dir.resolve() == Path(args.output_dir).resolve():
-        parser.error("Use a separate output directory; do not overwrite source scans")
+    if args.delta_mode == "matched" and (args.n_tau < 2 or args.n_train < 1):
+        parser.error("Matched mode requires --n-tau >= 2 and --n-train >= 1")
     if args.delta_mode in {"select", "matched"}:
         if len(args.seeds) != 5:
             parser.error("select/matched modes require exactly five distinct seeds")
-        if not 0 < args.n_validation < args.n_train:
-            parser.error("Require 0 < --n-validation < --n-train")
+        if args.delta_mode == "select" and (args.n_validation < 1 or args.n_train < 1):
+            parser.error("Require positive --n-validation and --n-train")
         if args.epochs < 1 or args.n_test < 1:
             parser.error("Selection requires positive --epochs and --n-test")
 
     output_dir = Path(args.output_dir)
+    if args.delta_mode == "select" and any((output_dir / name).exists() for name in
+            ("config.json", "optimal_deltas.csv", "delta_search_trials.csv")):
+        parser.error("Use a fresh output directory for the clean-validation ablation")
+    if args.delta_mode == "matched" and any((output_dir / name).exists() for name in
+            ("matched_study.csv", "matched_study_summary.csv", "validation_split_indices.npz")):
+        parser.error("Use a fresh output directory for the independent full-training matched study")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1337,26 +1392,36 @@ def main() -> None:
         "weight_decay": args.weight_decay,
         "loss": args.loss,
         "corruption_kind": "class",
+        "qstar_trajectory_diagnostic": {
+            "event_scope": "every fitting-sample q_star selection in every training epoch",
+            "simplex_boundary_rule": "min_c(q_star_c) <= 1e-7",
+            "edge_tolerance": 1e-7,
+        },
     }
     if args.delta_mode == "select":
         from delta_search import UNIT_DELTA_GRID, run_delta_selection_study
         config_dump["delta_selection"] = {
             "mode": "select", "methods": ["pmm", "lv", "qcor", "tv"],
-            "n_validation": args.n_validation, "n_fit": args.n_train - args.n_validation,
-            "selection_metric": "mean_validation_accuracy", "tie_break": "smaller_delta",
+            "n_validation": args.n_validation, "n_fit": args.n_train,
+            "selection_metric": "maximum_mean_clean_hard_validation_accuracy",
+            "validation_target": "independent_sampled_clean_hard_labels", "tie_break": "smaller_delta",
+            "additional_clean_label_budget_per_seed": args.n_validation,
+            "total_additional_clean_label_budget": len(args.seeds) * args.n_validation,
+            "validation_seeds": [int(np.random.SeedSequence([s, 2]).generate_state(1)[0]) for s in args.seeds],
             "unit_delta_grid": list(UNIT_DELTA_GRID),
             "pmm_initial_delta": 0.05, "pmm_initial_step": 0.05,
             "pmm_step_growth": 1.5, "pmm_stop_metric": "mean_normalized_area",
-            "pmm_stop_rule": "delta >= pooled_training_Q95 AND adjacent_area_increment < 0.01",
-            "final_evaluation": "saved_fitting_subset_checkpoints_without_refit",
+            "pmm_stop_rule": "delta >= pooled_training_Q95 AND adjacent_area_increment < 0.005",
+            "final_evaluation": "saved_full_training_checkpoints_without_validation_refit",
         }
     if args.delta_mode == "matched":
         config_dump["matched_imprecision"] = {
-            "methods": ["pmm", "lv", "qcor", "tv"], "n_validation": args.n_validation,
-            "n_fit": args.n_train - args.n_validation, "epsilon_A": .005,
-            "n_tau": 5, "tau_grid": "linspace(common_min, common_max, 5), endpoints included",
-            "area_data": "noisy fitting labels only", "refinement": "linear interpolation then bisection",
-            "scan_dir": str(args.scan_dir.resolve()) if args.scan_dir else None,
+            "methods": ["pmm", "lv", "qcor", "tv"], "n_validation": 0,
+            "n_fit": args.n_train, "epsilon_A": .005, "independent": True,
+            "n_tau": args.n_tau, "tau_grid": "linspace(common_min, common_max, n_tau), endpoints included",
+            "area_data": "all noisy training labels; no models trained during scan",
+            "refinement": "linear interpolation then bisection",
+            "references": "all other credal methods and hard/oracle/noisy-soft baselines",
         }
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(config_dump, f, indent=2)
@@ -1364,7 +1429,7 @@ def main() -> None:
     if args.delta_mode == "matched":
         from matched_imprecision import run_matched_study
         run_matched_study(output_dir, args.n_train, args.n_test, args.seeds,
-                          train_config, device, args.rho_values, args.n_validation, args.scan_dir)
+                          train_config, device, args.rho_values, n_tau=args.n_tau)
         print("Done.")
         return
     if args.delta_mode == "select":
